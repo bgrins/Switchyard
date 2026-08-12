@@ -463,6 +463,7 @@ impl TranslatingLlmClient {
         model: Option<&str>,
         wire_format: WireFormat,
     ) -> Result<RawResponse> {
+        let response_namespaces = responses_tool_namespaces(&raw_http_request, wire_format);
         let llm_request = decode_request(wire_format, &raw_http_request)
             .map_err(|error| LlmClientError::RequestTranslation(error.to_string()))?;
         // The model that serves the call — the rewrite target when the caller pinned
@@ -490,14 +491,25 @@ impl TranslatingLlmClient {
 
         match response.llm_response {
             LlmResponse::Agg(agg) => {
-                let body =
+                let mut body =
                     encode_aggregated_response(&agg, wire_format, served_model.as_deref())
                         .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
+                restore_responses_tool_namespaces(&mut body, &response_namespaces);
                 Ok(RawResponse::Buffered(body))
             }
             LlmResponse::Stream(chunks) => {
                 let events = encode_stream(chunks, wire_format, served_model)?;
-                Ok(RawResponse::Stream(events))
+                if response_namespaces.is_empty() {
+                    Ok(RawResponse::Stream(events))
+                } else {
+                    let events = events.map(move |event| {
+                        event.map(|mut value| {
+                            restore_responses_tool_namespaces(&mut value, &response_namespaces);
+                            value
+                        })
+                    });
+                    Ok(RawResponse::Stream(Box::pin(events)))
+                }
             }
         }
     }
@@ -790,6 +802,100 @@ fn is_reserved_header(name: &str) -> bool {
     RESERVED_HEADERS
         .iter()
         .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+// Returns the MCP namespace for every unambiguous function exposed by an
+// OpenAI Responses request. Codex wraps MCP functions in a non-standard
+// ``namespace`` tool, while OpenAI-compatible upstreams accept only its child
+// function tools. Keeping this lookup at the raw proxy boundary lets the
+// response reintroduce the namespace Codex needs for MCP dispatch.
+fn responses_tool_namespaces(body: &Value, wire_format: WireFormat) -> HashMap<String, String> {
+    if wire_format != WireFormat::OpenAiResponses {
+        return HashMap::new();
+    }
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return HashMap::new();
+    };
+    let mut namespaces = HashMap::new();
+    collect_responses_tool_namespaces(tools, None, &mut namespaces);
+    namespaces
+        .into_iter()
+        .filter_map(|(name, namespace)| namespace.map(|namespace| (name, namespace)))
+        .collect()
+}
+
+// A None entry marks a duplicate tool name under different MCP namespaces. A
+// plain function call cannot disambiguate those safely, so it remains flat.
+fn collect_responses_tool_namespaces(
+    tools: &[Value],
+    parent_namespace: Option<&str>,
+    namespaces: &mut HashMap<String, Option<String>>,
+) {
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            let namespace = tool.get("name").and_then(Value::as_str);
+            if let Some(children) = tool.get("tools").and_then(Value::as_array) {
+                collect_responses_tool_namespaces(children, namespace, namespaces);
+            }
+            continue;
+        }
+        let Some(namespace) = parent_namespace else {
+            continue;
+        };
+        let name = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .or_else(|| tool.get("name"))
+            .or_else(|| tool.get("id"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        let Some(name) = name else {
+            continue;
+        };
+        match namespaces.get(name) {
+            None => {
+                namespaces.insert(name.to_string(), Some(namespace.to_string()));
+            }
+            Some(Some(existing)) if existing != namespace => {
+                namespaces.insert(name.to_string(), None);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+// Adds a Codex-compatible namespace field to every outbound Responses function
+// call whose name originated from an unambiguously flattened MCP namespace.
+// This visits buffered Responses bodies and all Responses streaming events.
+fn restore_responses_tool_namespaces(body: &mut Value, namespaces: &HashMap<String, String>) {
+    if namespaces.is_empty() {
+        return;
+    }
+    match body {
+        Value::Array(values) => {
+            for value in values {
+                restore_responses_tool_namespaces(value, namespaces);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(name) = object.get("name").and_then(Value::as_str)
+                && let Some(namespace) = namespaces.get(name)
+            {
+                object
+                    .entry("namespace".to_string())
+                    .or_insert_with(|| Value::String(namespace.clone()));
+            }
+            for value in object.values_mut() {
+                restore_responses_tool_namespaces(value, namespaces);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1870,6 +1976,70 @@ mod tests {
         assert_eq!(body["choices"][0]["message"]["content"], "Hi there");
         // The client sees the model that answered, not the "client-facing" route id.
         assert_eq!(body["model"], "gpt");
+        Ok(())
+    }
+
+    // A Codex MCP namespace is flattened for the Chat upstream, then restored
+    // on the Responses function call that comes back to Codex.
+    #[tokio::test]
+    async fn call_rewrite_model_raw_restores_codex_mcp_namespace()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "search"}
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "search", "arguments": "{\\\"q\\\":\\\"rust\\\"}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let raw = json!({
+            "model": "client-facing",
+            "input": "Search for Rust.",
+            "tools": [{
+                "type": "namespace",
+                "name": "mcp__open_websearch__",
+                "tools": [{
+                    "type": "function",
+                    "name": "search",
+                    "description": "Search the web",
+                    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+                }]
+            }]
+        });
+
+        let RawResponse::Buffered(body) = client
+            .call_rewrite_model_raw(raw, None, Some("gpt"), WireFormat::OpenAiResponses)
+            .await?
+        else {
+            panic!("expected a buffered response");
+        };
+
+        assert_eq!(body["output"][0]["type"], "function_call");
+        assert_eq!(body["output"][0]["name"], "search");
+        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch__");
         Ok(())
     }
 

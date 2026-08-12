@@ -709,6 +709,13 @@ fn request_role_from_responses(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 // Decodes Responses tool shapes, including Codex-style tool entries.
+//
+// Codex groups each MCP server's tools in a non-standard ``namespace``
+// container. OpenAI-compatible upstreams such as Together accept only flat
+// function definitions, so recursively expose the namespace children under
+// their original names. The response codec preserves those names in its plain
+// ``function_call`` items; dispatching an unnamespaced MCP call remains the
+// Codex client's responsibility.
 fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
     let Some(tools) = value.and_then(Value::as_array) else {
         return Vec::new();
@@ -718,7 +725,9 @@ fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
         let Some(tool) = tool.as_object() else {
             continue;
         };
-        if tool.get("type").and_then(Value::as_str) == Some("function") {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            out.extend(decode_responses_tools(tool.get("tools")));
+        } else if tool.get("type").and_then(Value::as_str) == Some("function") {
             if let Some(function) = tool.get("function").and_then(Value::as_object) {
                 if let Some(name) = function.get("name").and_then(Value::as_str)
                     && !name.is_empty()

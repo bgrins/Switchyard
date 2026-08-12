@@ -449,6 +449,51 @@ fn responses_request_translates_codex_tool_shape_to_openai_chat() -> TestResult 
     Ok(())
 }
 
+// Verifies Codex MCP namespace containers flatten to functions for Chat-only
+// upstream providers, while the child name stays suitable for the Responses
+// function-call response path.
+#[test]
+fn responses_request_flattens_codex_mcp_namespace_tools() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-4",
+        "input": "List files",
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__filesystem",
+            "description": "Filesystem MCP tools",
+            "tools": [{
+                "type": "function",
+                "name": "list_files",
+                "description": "List files in a directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }]
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    assert_eq!(output["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(output["tools"][0]["type"], "function");
+    assert_eq!(output["tools"][0]["function"]["name"], "list_files");
+    assert_eq!(
+        output["tools"][0]["function"]["parameters"]["required"],
+        json!(["path"])
+    );
+    Ok(())
+}
+
 // Verifies Python-style Responses tool definitions translate into OpenAI Chat tools.
 #[test]
 fn responses_request_translates_python_compatible_tool_shape_to_openai_chat() -> TestResult {
