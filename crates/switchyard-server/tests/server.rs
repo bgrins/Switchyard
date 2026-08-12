@@ -123,6 +123,21 @@ async fn upstream_chat(
             .into_response();
     }
     if body["stream"].as_bool() == Some(true) {
+        // Streamed tool call, for the namespace-on-every-event assertions.
+        if body["messages"][0]["content"] == "mcp-tool-call" {
+            let events = [
+                json!({"id": "chatcmpl-mcp", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "search", "arguments": ""}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-mcp", "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"q\":\"rust\"}"}}]}}]}).to_string(),
+                json!({"id": "chatcmpl-mcp", "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}}).to_string(),
+                "[DONE]".to_string(),
+            ];
+            let stream = futures_util::stream::iter(
+                events
+                    .into_iter()
+                    .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
+            );
+            return Sse::new(stream).into_response();
+        }
         if body["messages"][0]["content"] == "stream-error" {
             let events = [
                 json!({"id": "chatcmpl-stream-error", "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}}]}).to_string(),
@@ -151,6 +166,30 @@ async fn upstream_chat(
                 .map(|data| Ok::<Event, Infallible>(Event::default().data(data))),
         );
         return Sse::new(stream).into_response();
+    }
+
+    // Buffered tool call, the non-streaming counterpart of the branch above.
+    if body["messages"][0]["content"] == "mcp-tool-call" {
+        return Json(json!({
+            "id": "chatcmpl-mcp",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{\"q\":\"rust\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}
+        }))
+        .into_response();
     }
 
     let custom_target_schema = body
@@ -2136,5 +2175,121 @@ async fn request_and_upstream_errors_use_the_inbound_wire_format() -> TestResult
             }
         })
     );
+    Ok(())
+}
+
+// Returns every `data:` frame of an SSE body as JSON, skipping `[DONE]`.
+fn sse_events(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+// The Codex request shape: MCP tools wrapped in a `namespace` container.
+fn codex_mcp_responses_request(stream: bool) -> Value {
+    json!({
+        "model": ROUTE_MODEL,
+        "input": "mcp-tool-call",
+        "stream": stream,
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__open_websearch__",
+            "description": "Web search MCP tools",
+            "tools": [{
+                "type": "function",
+                "name": "search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"]
+                }
+            }]
+        }]
+    })
+}
+
+// The container is flattened for a Chat-only upstream, and the namespace is
+// restored on the returned function call.
+#[tokio::test]
+async fn responses_buffered_restores_codex_mcp_namespace() -> TestResult {
+    const MODEL: &str = "model/mcp-buffered";
+    let (upstream, app) = test_app(&[(ROUTE_MODEL, &[MODEL])]).await?;
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(codex_mcp_responses_request(false)),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let body = response.json()?;
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "search");
+    assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch__");
+
+    // The upstream must never see the `namespace` container itself.
+    let calls = upstream.calls.lock().await;
+    let tools = calls[0]["tools"]
+        .as_array()
+        .ok_or("upstream received no tools")?;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"], "function");
+    assert_eq!(tools[0]["function"]["name"], "search");
+    assert!(
+        calls[0]["tools"][0].get("namespace").is_none(),
+        "namespace container leaked upstream"
+    );
+    Ok(())
+}
+
+// The namespace has to survive on every output-item event, not only on the
+// terminal aggregate.
+#[tokio::test]
+async fn responses_stream_restores_codex_mcp_namespace() -> TestResult {
+    const MODEL: &str = "model/mcp-stream";
+    let (_upstream, app) = test_app(&[(ROUTE_MODEL, &[MODEL])]).await?;
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/responses",
+        Some(codex_mcp_responses_request(true)),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let events = sse_events(response.text()?);
+
+    let namespace_of = |event_type: &str| -> Option<Value> {
+        events
+            .iter()
+            .find(|event| event["type"] == event_type)
+            .map(|event| event["item"]["namespace"].clone())
+    };
+    assert_eq!(
+        namespace_of("response.output_item.added"),
+        Some(json!("mcp__open_websearch__")),
+        "namespace missing from response.output_item.added"
+    );
+    assert_eq!(
+        namespace_of("response.output_item.done"),
+        Some(json!("mcp__open_websearch__")),
+        "namespace missing from response.output_item.done"
+    );
+
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .ok_or("stream produced no response.completed event")?;
+    assert_eq!(
+        completed["response"]["output"][0]["namespace"], "mcp__open_websearch__",
+        "namespace missing from the response.completed aggregate"
+    );
+    assert_eq!(completed["response"]["output"][0]["name"], "search");
     Ok(())
 }

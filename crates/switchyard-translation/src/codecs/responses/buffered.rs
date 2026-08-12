@@ -709,15 +709,24 @@ fn request_role_from_responses(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 // Decodes Responses tool shapes, including Codex-style tool entries.
+//
+// Codex groups each MCP server's tools in a non-standard ``namespace``
+// container that OpenAI-compatible upstreams do not accept, so the children are
+// exposed under their original names.
 fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
     let Some(tools) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // Decoded first so a flattened child sharing one of these names loses the
+    // tie below.
     for tool in tools {
         let Some(tool) = tool.as_object() else {
             continue;
         };
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            continue;
+        }
         if tool.get("type").and_then(Value::as_str) == Some("function") {
             if let Some(function) = tool.get("function").and_then(Value::as_object) {
                 if let Some(name) = function.get("name").and_then(Value::as_str)
@@ -745,6 +754,21 @@ fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
             push_responses_function_tool(&mut out, tool);
         } else {
             push_responses_id_tool(&mut out, tool);
+        }
+    }
+    // Flattening drops the container, so children distinct only by namespace
+    // collide into one name. Keep the first claim on each name.
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        for child in decode_responses_tools(tool.get("tools")) {
+            if !out.iter().any(|existing| existing.name == child.name) {
+                out.push(child);
+            }
         }
     }
     out

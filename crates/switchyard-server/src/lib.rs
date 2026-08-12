@@ -42,7 +42,7 @@ use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
 use tracing::{Instrument, Level};
 
-use switchyard_translation::{WireFormat, decode_request};
+use switchyard_translation::{WireFormat, decode_request, responses_tool_namespaces};
 
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
@@ -686,6 +686,7 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    let response_namespaces = responses_tool_namespaces(&body, wire_format);
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
@@ -728,10 +729,11 @@ async fn handle_llm_request(
     };
 
     let served_model = decision.map(|decision| decision.selected_model_id().to_string());
-    let mut response = match into_http_response(response, wire_format, served_model) {
-        Ok(response) => response,
-        Err(error) => return server_error(error.to_string()),
-    };
+    let mut response =
+        match into_http_response(response, wire_format, served_model, response_namespaces) {
+            Ok(response) => response,
+            Err(error) => return server_error(error.to_string()),
+        };
     if let Some(decision) = decision {
         attach_routing_headers(&mut response, decision);
     }

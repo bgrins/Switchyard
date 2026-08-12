@@ -3,12 +3,16 @@
 
 //! Response encoding glue for libsy server endpoints.
 
+use std::collections::HashMap;
 use std::error::Error;
 
 use axum::Json;
 use axum::response::{IntoResponse, Response as HttpResponse};
+use futures_util::StreamExt;
 use switchyard_protocol::{LlmResponse, Response as AlgorithmResponse};
-use switchyard_translation::{WireFormat, encode_aggregated_response, encode_stream};
+use switchyard_translation::{
+    WireFormat, encode_aggregated_response, encode_stream, restore_responses_tool_namespaces,
+};
 
 use crate::sse::frame_stream;
 
@@ -21,18 +25,24 @@ pub(crate) fn into_http_response(
     response: AlgorithmResponse,
     target_format: WireFormat,
     served_model: Option<String>,
+    response_namespaces: HashMap<String, String>,
 ) -> Result<HttpResponse, BoxError> {
     match response.llm_response {
-        LlmResponse::Agg(response) => Ok(Json(encode_aggregated_response(
-            &response,
-            target_format,
-            served_model.as_deref(),
-        )?)
-        .into_response()),
-        LlmResponse::Stream(stream) => Ok(frame_stream(
-            encode_stream(stream, target_format, served_model)?,
-            target_format,
-        )
-        .into_response()),
+        LlmResponse::Agg(response) => {
+            let mut body =
+                encode_aggregated_response(&response, target_format, served_model.as_deref())?;
+            restore_responses_tool_namespaces(&mut body, &response_namespaces);
+            Ok(Json(body).into_response())
+        }
+        LlmResponse::Stream(stream) => {
+            let events = encode_stream(stream, target_format, served_model)?;
+            let events = events.map(move |event| {
+                event.map(|mut value| {
+                    restore_responses_tool_namespaces(&mut value, &response_namespaces);
+                    value
+                })
+            });
+            Ok(frame_stream(Box::pin(events), target_format).into_response())
+        }
     }
 }

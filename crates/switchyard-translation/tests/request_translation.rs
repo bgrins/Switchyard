@@ -449,6 +449,132 @@ fn responses_request_translates_codex_tool_shape_to_openai_chat() -> TestResult 
     Ok(())
 }
 
+// Verifies Codex MCP namespace containers flatten to plain functions for a
+// Chat-only upstream.
+#[test]
+fn responses_request_flattens_codex_mcp_namespace_tools() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-4",
+        "input": "List files",
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__filesystem",
+            "description": "Filesystem MCP tools",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "mcp__filesystem__nested",
+                    "tools": [{
+                        "type": "function",
+                        "name": "stat_file",
+                        "parameters": {"type": "object"}
+                    }]
+                },
+                {
+                    "type": "function",
+                    "name": "list_files",
+                    "description": "List files in a directory",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }
+                }
+            ]
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    // A nested container flattens too, so both leaves arrive as plain functions.
+    let names = output["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, vec!["list_files", "stat_file"]);
+    assert_eq!(output["tools"][0]["type"], "function");
+    assert_eq!(
+        output["tools"][0]["function"]["parameters"]["required"],
+        json!(["path"])
+    );
+    Ok(())
+}
+
+// A child colliding with a tool outside the container must not reach the
+// upstream as a second tool of the same name.
+#[test]
+fn responses_request_drops_namespace_children_colliding_with_top_level_tools() -> TestResult {
+    let engine = TranslationEngine::default();
+    let body = json!({
+        "model": "gpt-4",
+        "input": "Read a file",
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Codex builtin",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {
+                "type": "namespace",
+                "name": "mcp__filesystem",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_file",
+                        "description": "MCP tool of the same name",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "function",
+                        "name": "list_files",
+                        "description": "MCP tool with a distinct name",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                ]
+            }
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let names = output["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(names, vec!["read_file", "list_files"]);
+    assert_eq!(
+        output["tools"][0]["function"]["description"],
+        "Codex builtin"
+    );
+    Ok(())
+}
+
 // Verifies Python-style Responses tool definitions translate into OpenAI Chat tools.
 #[test]
 fn responses_request_translates_python_compatible_tool_shape_to_openai_chat() -> TestResult {
