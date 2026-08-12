@@ -740,7 +740,7 @@ async fn handle_llm_request(
     response
 }
 
-// Request metadata held until the terminal response determines the event level.
+// Request metadata held until the terminal response determines whether it failed.
 struct RequestLogContext {
     started: Instant,
     wire_format: WireFormat,
@@ -787,21 +787,11 @@ impl RequestLogContext {
             };
         }
 
-        match request_log_level(response.status()) {
-            Level::ERROR => emit!(Level::ERROR, "LLM request failed"),
-            Level::WARN => emit!(Level::WARN, "LLM request failed"),
-            _ => emit!(Level::INFO, "LLM request handled"),
+        if response.status().is_server_error() {
+            emit!(Level::ERROR, "LLM request failed");
+        } else if !response.status().is_success() {
+            emit!(Level::WARN, "LLM request failed");
         }
-    }
-}
-
-fn request_log_level(status: StatusCode) -> Level {
-    if status.is_server_error() {
-        Level::ERROR
-    } else if status.is_success() {
-        Level::INFO
-    } else {
-        Level::WARN
     }
 }
 
@@ -1452,17 +1442,6 @@ mod tests {
             .expect("server exits cleanly");
         state.release.notify_one();
         request.abort();
-    }
-
-    // Terminal request severity follows HTTP status instead of error-path bookkeeping.
-    #[test]
-    fn request_log_level_follows_http_status() {
-        assert_eq!(request_log_level(StatusCode::OK), Level::INFO);
-        assert_eq!(request_log_level(StatusCode::BAD_REQUEST), Level::WARN);
-        assert_eq!(
-            request_log_level(StatusCode::INTERNAL_SERVER_ERROR),
-            Level::ERROR
-        );
     }
 
     // Canonical error text remains available without consuming the response body.
