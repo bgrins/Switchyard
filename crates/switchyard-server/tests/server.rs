@@ -2187,7 +2187,7 @@ fn sse_events(body: &str) -> Vec<Value> {
         .collect()
 }
 
-// The Codex request shape: MCP tools wrapped in a `namespace` container.
+// The Codex request shape: tools wrapped in a `namespace` container.
 fn codex_mcp_responses_request(stream: bool) -> Value {
     json!({
         "model": ROUTE_MODEL,
@@ -2195,7 +2195,7 @@ fn codex_mcp_responses_request(stream: bool) -> Value {
         "stream": stream,
         "tools": [{
             "type": "namespace",
-            "name": "mcp__open_websearch__",
+            "name": "mcp__open_websearch",
             "description": "Web search MCP tools",
             "tools": [{
                 "type": "function",
@@ -2230,7 +2230,7 @@ async fn responses_buffered_restores_codex_mcp_namespace() -> TestResult {
     let body = response.json()?;
     assert_eq!(body["output"][0]["type"], "function_call");
     assert_eq!(body["output"][0]["name"], "search");
-    assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch__");
+    assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
 
     // The upstream must never see the `namespace` container itself.
     let calls = upstream.calls.lock().await;
@@ -2240,8 +2240,8 @@ async fn responses_buffered_restores_codex_mcp_namespace() -> TestResult {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "search");
-    assert!(
-        calls[0]["tools"][0].get("namespace").is_none(),
+    assert_ne!(
+        calls[0]["tools"][0]["type"], "namespace",
         "namespace container leaked upstream"
     );
     Ok(())
@@ -2273,12 +2273,12 @@ async fn responses_stream_restores_codex_mcp_namespace() -> TestResult {
     };
     assert_eq!(
         namespace_of("response.output_item.added"),
-        Some(json!("mcp__open_websearch__")),
+        Some(json!("mcp__open_websearch")),
         "namespace missing from response.output_item.added"
     );
     assert_eq!(
         namespace_of("response.output_item.done"),
-        Some(json!("mcp__open_websearch__")),
+        Some(json!("mcp__open_websearch")),
         "namespace missing from response.output_item.done"
     );
 
@@ -2287,7 +2287,7 @@ async fn responses_stream_restores_codex_mcp_namespace() -> TestResult {
         .find(|event| event["type"] == "response.completed")
         .ok_or("stream produced no response.completed event")?;
     assert_eq!(
-        completed["response"]["output"][0]["namespace"], "mcp__open_websearch__",
+        completed["response"]["output"][0]["namespace"], "mcp__open_websearch",
         "namespace missing from the response.completed aggregate"
     );
     assert_eq!(completed["response"]["output"][0]["name"], "search");

@@ -449,7 +449,7 @@ fn responses_request_translates_codex_tool_shape_to_openai_chat() -> TestResult 
     Ok(())
 }
 
-// Verifies Codex MCP namespace containers flatten to plain functions for a
+// Verifies Codex namespace containers flatten to plain functions for a
 // Chat-only upstream.
 #[test]
 fn responses_request_flattens_codex_mcp_namespace_tools() -> TestResult {

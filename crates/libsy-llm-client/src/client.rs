@@ -1886,8 +1886,8 @@ mod tests {
         Ok(())
     }
 
-    // A Codex MCP namespace is flattened for the Chat upstream, then restored
-    // on the Responses function call that comes back to Codex.
+    // A Codex namespace is flattened for the Chat upstream, then restored on
+    // the Responses function call that comes back to Codex.
     #[tokio::test]
     async fn call_rewrite_model_raw_restores_codex_mcp_namespace()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -1927,7 +1927,7 @@ mod tests {
             "input": "Search for Rust.",
             "tools": [{
                 "type": "namespace",
-                "name": "mcp__open_websearch__",
+                "name": "mcp__open_websearch",
                 "tools": [{
                     "type": "function",
                     "name": "search",
@@ -1946,7 +1946,7 @@ mod tests {
 
         assert_eq!(body["output"][0]["type"], "function_call");
         assert_eq!(body["output"][0]["name"], "search");
-        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch__");
+        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
         // Arguments are parsed and re-serialized, so the spacing is normalized.
         assert_eq!(body["output"][0]["arguments"], "{\"q\": \"rust\"}");
         Ok(())

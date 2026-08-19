@@ -1,16 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Codex MCP namespace preservation across a Responses/Chat translation.
+//! Codex tool namespace preservation across a Responses/Chat translation.
 //!
-//! Codex groups each MCP server's tools in a non-standard ``namespace`` tool
-//! container and expects the namespace back on the function call it receives:
-//! `{"type": "function_call", "name": "search", "namespace": "mcp__docs__"}`.
+//! Codex groups tools into non-standard ``namespace`` containers — MCP servers,
+//! usually behind an `mcp__` prefix, plus builtin groups such as
+//! `multi_agent_v1` — and dispatches on the pair of tool name and namespace. It
+//! therefore expects the namespace back on the call it receives:
+//! `{"type": "function_call", "name": "search", "namespace": "mcp__docs"}`.
 //! OpenAI-compatible upstreams accept only flat `function` tools, so the request
-//! codec flattens the container and the namespace is lost.
+//! codec flattens the containers and the namespace is lost.
 //!
 //! Capturing the child-to-namespace mapping from the request lets the response
-//! path put it back.
+//! path put it back. No container name is filtered by prefix, because Codex
+//! resolves a call with no namespace against its default group: dropping a
+//! builtin group's namespace would look the call up in the wrong place.
 
 use std::collections::HashMap;
 
@@ -18,7 +22,7 @@ use serde_json::Value;
 
 use crate::WireFormat;
 
-/// Map every unambiguous Responses function tool to its Codex MCP namespace.
+/// Map every unambiguous Responses function tool to its Codex namespace.
 ///
 /// Returns an empty map for any wire format other than
 /// [`WireFormat::OpenAiResponses`], for a request without `tools`, and for any
@@ -91,7 +95,7 @@ fn collect_responses_tool_namespaces(
     }
 }
 
-/// Re-attach Codex MCP namespaces to every `function_call` in a response.
+/// Re-attach Codex namespaces to every `function_call` in a response.
 ///
 /// Walks the whole value, covering a buffered body and each streaming event,
 /// where the item is nested under `item` (`response.output_item.added` /
@@ -134,7 +138,7 @@ mod tests {
         json!({
             "tools": [{
                 "type": "namespace",
-                "name": "mcp__open_websearch__",
+                "name": "mcp__open_websearch",
                 "tools": [{
                     "type": "function",
                     "name": "search",
@@ -158,7 +162,7 @@ mod tests {
 
         restore_responses_tool_namespaces(&mut response, &namespaces);
 
-        assert_eq!(response["output"][0]["namespace"], "mcp__open_websearch__");
+        assert_eq!(response["output"][0]["namespace"], "mcp__open_websearch");
     }
 
     // Streaming events nest the item one level deeper than a buffered body.
@@ -181,22 +185,22 @@ mod tests {
         restore_responses_tool_namespaces(&mut added, &namespaces);
         restore_responses_tool_namespaces(&mut completed, &namespaces);
 
-        assert_eq!(added["item"]["namespace"], "mcp__open_websearch__");
+        assert_eq!(added["item"]["namespace"], "mcp__open_websearch");
         assert_eq!(
             completed["response"]["output"][0]["namespace"],
-            "mcp__open_websearch__"
+            "mcp__open_websearch"
         );
     }
 
     // A leaf name colliding with a top-level tool is equally ambiguous: stamping
-    // it would send that tool's calls to the MCP server.
+    // it would send that tool's calls to the namespaced tool instead.
     #[test]
     fn skips_names_shared_with_a_top_level_tool() {
         let namespaced_first = json!({
             "tools": [
                 {
                     "type": "namespace",
-                    "name": "mcp__fs__",
+                    "name": "mcp__fs",
                     "tools": [{"type": "function", "name": "read_file"}]
                 },
                 {"type": "function", "name": "read_file", "parameters": {}}
@@ -207,7 +211,7 @@ mod tests {
                 {"type": "function", "name": "read_file", "parameters": {}},
                 {
                     "type": "namespace",
-                    "name": "mcp__fs__",
+                    "name": "mcp__fs",
                     "tools": [{"type": "function", "name": "read_file"}]
                 }
             ]
@@ -234,18 +238,51 @@ mod tests {
         assert!(responses_tool_namespaces(&request, WireFormat::OpenAiResponses).is_empty());
     }
 
-    // Both the collector and the flattener recurse, so a leaf is attributed to
-    // the innermost container that names it.
+    // Codex namespaces builtin tool groups too, so nothing may key on the
+    // `mcp__` prefix. `multi_agent_v1` is the load-bearing case: it changes
+    // where Codex looks the call up. `functions` is Codex's default group, so
+    // stamping it is inert — it is here to pin that it is not special-cased.
+    #[test]
+    fn maps_namespaces_that_are_not_mcp_servers() {
+        let request = json!({
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "tools": [{"type": "function", "name": "spawn_agent"}]
+                },
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [{"type": "function", "name": "update_plan"}]
+                }
+            ]
+        });
+
+        let namespaces = responses_tool_namespaces(&request, WireFormat::OpenAiResponses);
+
+        assert_eq!(
+            namespaces.get("spawn_agent").map(String::as_str),
+            Some("multi_agent_v1")
+        );
+        assert_eq!(
+            namespaces.get("update_plan").map(String::as_str),
+            Some("functions")
+        );
+    }
+
+    // Codex does not nest containers today, but both the collector and the
+    // flattener recurse, so pin that a leaf follows the innermost name.
     #[test]
     fn attributes_a_nested_leaf_to_its_innermost_namespace() {
         let request = json!({
             "tools": [{
                 "type": "namespace",
-                "name": "mcp__outer__",
+                "name": "mcp__outer",
                 "tools": [
                     {
                         "type": "namespace",
-                        "name": "mcp__inner__",
+                        "name": "mcp__inner",
                         "tools": [{"type": "function", "name": "stat_file"}]
                     },
                     {"type": "function", "name": "list_files"}
@@ -257,11 +294,11 @@ mod tests {
 
         assert_eq!(
             namespaces.get("stat_file").map(String::as_str),
-            Some("mcp__inner__")
+            Some("mcp__inner")
         );
         assert_eq!(
             namespaces.get("list_files").map(String::as_str),
-            Some("mcp__outer__")
+            Some("mcp__outer")
         );
     }
 
@@ -272,12 +309,12 @@ mod tests {
             "tools": [
                 {
                     "type": "namespace",
-                    "name": "mcp__first__",
+                    "name": "mcp__first",
                     "tools": [{"type": "function", "name": "search"}]
                 },
                 {
                     "type": "namespace",
-                    "name": "mcp__second__",
+                    "name": "mcp__second",
                     "tools": [{"type": "function", "name": "search"}]
                 }
             ]
@@ -294,13 +331,13 @@ mod tests {
             "output": [{
                 "type": "function_call",
                 "name": "search",
-                "namespace": "mcp__upstream__"
+                "namespace": "mcp__upstream"
             }]
         });
 
         restore_responses_tool_namespaces(&mut response, &namespaces);
 
-        assert_eq!(response["output"][0]["namespace"], "mcp__upstream__");
+        assert_eq!(response["output"][0]["namespace"], "mcp__upstream");
     }
 
     #[test]
