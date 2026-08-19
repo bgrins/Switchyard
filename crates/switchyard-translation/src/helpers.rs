@@ -55,6 +55,7 @@ pub fn encode_aggregated_response(
     agg: &AggLlmResponse,
     wire_format: WireFormat,
     served_model: Option<&str>,
+    request_tools: &[switchyard_protocol::ToolDefinition],
 ) -> Result<Value> {
     let mut body = DEFAULT_TRANSLATION_ENGINE
         .encode_response(wire_format, agg, &DEFAULT_TRANSLATION_POLICY)?
@@ -62,6 +63,10 @@ pub fn encode_aggregated_response(
     if let (Some(model), Value::Object(object)) = (served_model, &mut body) {
         object.insert("model".to_string(), Value::String(model.to_string()));
     }
+    crate::codex_namespaces::restore_qualified_tool_names(
+        &mut body,
+        &crate::codex_namespaces::qualified_tool_origins(request_tools),
+    );
     Ok(body)
 }
 
@@ -85,7 +90,9 @@ pub fn encode_stream(
     chunks: LlmResponseStream,
     target: WireFormat,
     served_model: Option<String>,
+    request_tools: &[switchyard_protocol::ToolDefinition],
 ) -> std::result::Result<RawEventStream, LlmClientError> {
+    let origins = crate::codex_namespaces::qualified_tool_origins(request_tools);
     let target_format: FormatId = target.into();
     // The target is always a built-in wire format, so this lookup cannot fail; a
     // failure returns as an `Err` rather than a panic.
@@ -115,6 +122,7 @@ pub fn encode_stream(
                     target,
                     served_model_for_events.as_deref(),
                 );
+                crate::codex_namespaces::restore_qualified_tool_names(&mut value, &origins);
                 yield value;
             }
             if state.errored {
@@ -127,6 +135,7 @@ pub fn encode_stream(
                 target,
                 served_model_for_events.as_deref(),
             );
+            crate::codex_namespaces::restore_qualified_tool_names(&mut value, &origins);
             yield value;
         }
     };
@@ -330,7 +339,7 @@ mod tests {
 
         // `served_model` overrides the id the upstream reported.
         let encoded =
-            encode_aggregated_response(&agg, WireFormat::OpenAiChat, Some("served/model"))?;
+            encode_aggregated_response(&agg, WireFormat::OpenAiChat, Some("served/model"), &[])?;
         assert_eq!(encoded["model"], "served/model");
         assert_eq!(encoded["choices"][0]["message"]["content"], "Hi there");
         Ok(())
@@ -357,7 +366,7 @@ mod tests {
         .boxed();
 
         let events = block_on(
-            encode_stream(chunks, WireFormat::OpenAiChat, Some("m".to_string()))?
+            encode_stream(chunks, WireFormat::OpenAiChat, Some("m".to_string()), &[])?
                 .collect::<Vec<_>>(),
         )
         .into_iter()
@@ -400,6 +409,7 @@ mod tests {
                 chunks,
                 WireFormat::AnthropicMessages,
                 Some("served/model".to_string()),
+                &[],
             )?
             .collect::<Vec<_>>(),
         )
@@ -430,7 +440,7 @@ mod tests {
         .boxed();
 
         let events = block_on(
-            encode_stream(chunks, WireFormat::AnthropicMessages, None)?.collect::<Vec<_>>(),
+            encode_stream(chunks, WireFormat::AnthropicMessages, None, &[])?.collect::<Vec<_>>(),
         )
         .into_iter()
         .collect::<Result<Vec<Value>, BoxError>>()?;
@@ -447,7 +457,7 @@ mod tests {
             )])
             .boxed();
         let results =
-            block_on(encode_stream(chunks, WireFormat::OpenAiChat, None)?.collect::<Vec<_>>());
+            block_on(encode_stream(chunks, WireFormat::OpenAiChat, None, &[])?.collect::<Vec<_>>());
         assert!(results.iter().any(Result::is_err));
         Ok(())
     }
@@ -484,9 +494,10 @@ mod tests {
                     .into()),
                 ])
                 .boxed();
-                let events = block_on(encode_stream(chunks, target, None)?.collect::<Vec<_>>())
-                    .into_iter()
-                    .collect::<Result<Vec<Value>, BoxError>>()?;
+                let events =
+                    block_on(encode_stream(chunks, target, None, &[])?.collect::<Vec<_>>())
+                        .into_iter()
+                        .collect::<Result<Vec<Value>, BoxError>>()?;
                 let body = serde_json::to_string(&events)?;
                 assert!(
                     body.contains("before"),
@@ -521,10 +532,11 @@ mod tests {
             }))
             .boxed();
 
-        let events =
-            block_on(encode_stream(chunks, WireFormat::OpenAiResponses, None)?.collect::<Vec<_>>())
-                .into_iter()
-                .collect::<Result<Vec<Value>, BoxError>>()?;
+        let events = block_on(
+            encode_stream(chunks, WireFormat::OpenAiResponses, None, &[])?.collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect::<Result<Vec<Value>, BoxError>>()?;
 
         assert_eq!(events, vec![json!({"type": "error", "message": "boom"})]);
         Ok(())
@@ -552,7 +564,7 @@ mod tests {
         ])
         .boxed();
         let events =
-            block_on(encode_stream(chunks, WireFormat::OpenAiChat, None)?.collect::<Vec<_>>())
+            block_on(encode_stream(chunks, WireFormat::OpenAiChat, None, &[])?.collect::<Vec<_>>())
                 .into_iter()
                 .collect::<Result<Vec<Value>, BoxError>>()?;
         let body = serde_json::to_string(&events)?;
@@ -599,10 +611,11 @@ mod tests {
             async move { Ok::<Vec<u8>, LlmClientError>(frame) }
         });
         let decoded = decode_stream(bytes, WireFormat::OpenAiChat)?;
-        let replayed =
-            block_on(encode_stream(decoded, WireFormat::OpenAiChat, None)?.collect::<Vec<_>>())
-                .into_iter()
-                .collect::<Result<Vec<Value>, BoxError>>()?;
+        let replayed = block_on(
+            encode_stream(decoded, WireFormat::OpenAiChat, None, &[])?.collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .collect::<Result<Vec<Value>, BoxError>>()?;
 
         assert_eq!(replayed, vec![provider_event]);
         Ok(())

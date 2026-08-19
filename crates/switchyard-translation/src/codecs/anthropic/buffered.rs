@@ -602,6 +602,7 @@ fn decode_anthropic_content_block(
                 .unwrap_or_default()
                 .to_string(),
             arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+            provider: ProviderExtensions::default(),
         })],
         Some("tool_result") => vec![ContentBlock::ToolResult(ToolResult {
             tool_call_id: block
@@ -696,6 +697,7 @@ fn decode_anthropic_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
                     .cloned()
                     .unwrap_or_else(|| json!({})),
                 strict: None,
+                provider: ProviderExtensions::default(),
             })
         })
         .collect()
@@ -881,7 +883,7 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Vec<Value> {
         ContentBlock::ToolCall(call) => vec![json!({
             "type": "tool_use",
             "id": sanitize_anthropic_tool_use_id(&call.id),
-            "name": call.name,
+            "name": crate::codex_namespaces::qualified_call_name(call),
             "input": anthropic_tool_input(&call.arguments),
         })],
         ContentBlock::ToolResult(result) => {
@@ -1019,7 +1021,7 @@ fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Value {
             .iter()
             .map(|tool| {
                 json!({
-                    "name": tool.name,
+                    "name": crate::codex_namespaces::qualified_tool_name(tool),
                     "description": tool.description.clone().unwrap_or_default(),
                     "input_schema": tool.parameters,
                 })

@@ -433,6 +433,7 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "Bash".to_string(),
                             arguments: json!({"command": "cargo test"}),
+                            ..Default::default()
                         })],
                     },
                     Message {

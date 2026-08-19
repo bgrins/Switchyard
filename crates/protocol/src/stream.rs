@@ -16,7 +16,10 @@ use serde_json::Value;
 use crate::{
     LlmClientError,
     format::FormatId,
-    llm::{AggLlmResponse, ContentBlock, ResponseOutput, Role, StopReason, ToolCall, Usage},
+    llm::{
+        AggLlmResponse, ContentBlock, ProviderExtensions, ResponseOutput, Role, StopReason,
+        ToolCall, Usage,
+    },
 };
 
 /// Status reported for an upstream error delivered inside a streaming body. The
@@ -430,6 +433,7 @@ impl ResponseAccumulator {
                 id: call.id.unwrap_or_default(),
                 name: call.name.unwrap_or_default(),
                 arguments: parse_tool_arguments(&call.arguments),
+                provider: ProviderExtensions::default(),
             }));
         }
         AggLlmResponse {
@@ -617,6 +621,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "lookup".to_string(),
                 arguments: json!({"q": "rust"}),
+                ..Default::default()
             })]
         );
     }

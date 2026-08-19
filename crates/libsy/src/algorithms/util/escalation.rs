@@ -429,6 +429,7 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "bash".to_string(),
                     arguments: json!({"cmd": "ls"}),
+                    ..Default::default()
                 }),
             ],
         };

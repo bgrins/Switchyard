@@ -200,6 +200,41 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed tool arguments.
     pub arguments: Value,
+    /// Provider call fields without normalized equivalents, such as the Codex
+    /// namespace the called tool was grouped under.
+    #[serde(default, skip_serializing_if = "ProviderExtensions::is_empty")]
+    pub provider: ProviderExtensions,
+}
+
+/// Empty arguments rather than `null`, so a defaulted call is still valid to send.
+impl Default for ToolCall {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            arguments: Value::Object(Map::new()),
+            provider: ProviderExtensions::default(),
+        }
+    }
+}
+
+impl ToolCall {
+    /// Returns the Codex namespace the called tool was grouped under, when set.
+    pub fn namespace(&self) -> Option<&str> {
+        self.provider
+            .fields
+            .get(ToolDefinition::NAMESPACE_KEY)
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+    }
+
+    /// Records the Codex namespace the called tool was grouped under.
+    pub fn set_namespace(&mut self, namespace: &str) {
+        self.provider.fields.insert(
+            ToolDefinition::NAMESPACE_KEY.to_string(),
+            Value::String(namespace.to_string()),
+        );
+    }
 }
 
 /// Normalized tool result message content.
@@ -224,6 +259,45 @@ pub struct ToolDefinition {
     pub parameters: Value,
     /// Whether the provider should enforce the schema strictly.
     pub strict: Option<bool>,
+    /// Provider tool fields without normalized equivalents, such as the Codex
+    /// namespace a tool was grouped under.
+    #[serde(default, skip_serializing_if = "ProviderExtensions::is_empty")]
+    pub provider: ProviderExtensions,
+}
+
+/// An empty schema rather than `null`, so a defaulted tool is still valid to send.
+impl Default for ToolDefinition {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: None,
+            parameters: Value::Object(Map::new()),
+            strict: None,
+            provider: ProviderExtensions::default(),
+        }
+    }
+}
+
+impl ToolDefinition {
+    /// Key under which a Codex tool namespace is carried in [`Self::provider`].
+    pub const NAMESPACE_KEY: &'static str = "namespace";
+
+    /// Returns the Codex namespace this tool was grouped under, when set.
+    pub fn namespace(&self) -> Option<&str> {
+        self.provider
+            .fields
+            .get(Self::NAMESPACE_KEY)
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+    }
+
+    /// Records the Codex namespace this tool was grouped under.
+    pub fn set_namespace(&mut self, namespace: &str) {
+        self.provider.fields.insert(
+            Self::NAMESPACE_KEY.to_string(),
+            Value::String(namespace.to_string()),
+        );
+    }
 }
 
 /// Normalized tool choice policy.
@@ -283,6 +357,13 @@ pub struct ProviderExtensions {
     /// Codecs use these fields when translating to another format. Exact
     /// same-format replay is controlled separately by [`PreservationMetadata`].
     pub fields: Map<String, Value>,
+}
+
+impl ProviderExtensions {
+    /// Returns true when no provider fields were captured.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
 }
 
 /// Exact source payloads retained for lossless same-format round trips.
@@ -482,6 +563,7 @@ mod tests {
             id: "call-1".to_string(),
             name: "lookup".to_string(),
             arguments: json!({"query": "rust"}),
+            ..Default::default()
         });
         assert_eq!(
             serde_json::to_value(tool_call)?,
@@ -493,5 +575,12 @@ mod tests {
             })
         );
         Ok(())
+    }
+    // A defaulted tool must still be valid to send: `{}` accepts any arguments,
+    // whereas `null` is not a schema and is rejected by providers.
+    #[test]
+    fn defaults_use_empty_objects_not_null() {
+        assert!(ToolDefinition::default().parameters.is_object());
+        assert!(ToolCall::default().arguments.is_object());
     }
 }

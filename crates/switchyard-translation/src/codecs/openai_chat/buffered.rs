@@ -339,7 +339,7 @@ impl FormatCodec for OpenAiChatCodec {
                             "id": call.id,
                             "type": "function",
                             "function": {
-                                "name": call.name,
+                                "name": crate::codex_namespaces::qualified_call_name(call),
                                 "arguments": json_string(&call.arguments),
                             },
                         })),
@@ -642,6 +642,7 @@ pub(crate) fn decode_openai_tool_call(
         id,
         name,
         arguments,
+        provider: ProviderExtensions::default(),
     }))
 }
 
@@ -691,6 +692,7 @@ pub(crate) fn decode_openai_tools(
                 .cloned()
                 .unwrap_or_else(|| json!({})),
             strict: function.get("strict").and_then(Value::as_bool),
+            provider: ProviderExtensions::default(),
         });
     }
     Ok(definitions)
@@ -825,7 +827,7 @@ fn encode_message_without_tool_results_to_openai(
                 "id": call.id,
                 "type": "function",
                 "function": {
-                    "name": call.name,
+                    "name": crate::codex_namespaces::qualified_call_name(call),
                     "arguments": json_string(&call.arguments),
                 },
             })),
@@ -1177,8 +1179,10 @@ pub(crate) fn encode_openai_tools(tools: &[ToolDefinition]) -> Value {
         tools
             .iter()
             .map(|tool| {
+                // A namespaced tool goes upstream under a qualified name so that
+                // two tools differing only by namespace stay distinct.
                 let mut function = json!({
-                    "name": tool.name,
+                    "name": crate::codex_namespaces::qualified_tool_name(tool),
                     "description": tool.description.clone().unwrap_or_default(),
                     "parameters": tool.parameters,
                 });

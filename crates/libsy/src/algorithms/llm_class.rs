@@ -1475,6 +1475,7 @@ mod tests {
                 id: id.to_string(),
                 name: "search".to_string(),
                 arguments: Value::Null,
+                ..Default::default()
             })],
         }
     }

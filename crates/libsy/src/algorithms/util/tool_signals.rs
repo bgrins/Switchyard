@@ -624,6 +624,7 @@ mod tests {
                 id: String::new(),
                 name: name.to_string(),
                 arguments: json!({}),
+                ..Default::default()
             })],
         }
     }
@@ -636,6 +637,7 @@ mod tests {
                 id: String::new(),
                 name: "Bash".to_string(),
                 arguments: json!({"command": command}),
+                ..Default::default()
             })],
         }
     }

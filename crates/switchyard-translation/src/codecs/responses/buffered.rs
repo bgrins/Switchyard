@@ -414,7 +414,7 @@ fn decode_responses_input(
                                 }
                                 DeterministicIdPolicy::Preserve => String::new(),
                             });
-                        pending_tool_calls.push(ToolCall {
+                        let mut call = ToolCall {
                             id,
                             name: item
                                 .get("name")
@@ -422,7 +422,16 @@ fn decode_responses_input(
                                 .unwrap_or_default()
                                 .to_string(),
                             arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                        });
+                            provider: ProviderExtensions::default(),
+                        };
+                        if let Some(namespace) = item
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .filter(|namespace| !namespace.is_empty())
+                        {
+                            call.set_namespace(namespace);
+                        }
+                        pending_tool_calls.push(call);
                     }
                     Some("function_call_output") => {
                         let tool_call_id = item
@@ -735,15 +744,24 @@ fn request_role_from_responses(role: Option<&str>, path: &str) -> Result<Role> {
 }
 
 // Decodes Responses tool shapes, including Codex-style tool entries.
+//
+// Codex groups tools into non-standard ``namespace`` containers — per MCP
+// server, and for builtin groups — that OpenAI-compatible upstreams do not
+// accept, so the children are exposed under their original names.
 fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
     let Some(tools) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // Tools outside any container are decoded first. They keep their bare names,
+    // and `qualified_tool_origins` refuses to guess a bare name they share.
     for tool in tools {
         let Some(tool) = tool.as_object() else {
             continue;
         };
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            continue;
+        }
         if tool.get("type").and_then(Value::as_str) == Some("function") {
             if let Some(function) = tool.get("function").and_then(Value::as_object) {
                 if let Some(name) = function.get("name").and_then(Value::as_str)
@@ -760,6 +778,7 @@ fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
                             .cloned()
                             .unwrap_or_else(|| json!({})),
                         strict: function.get("strict").and_then(Value::as_bool),
+                        provider: ProviderExtensions::default(),
                     });
                 }
             } else {
@@ -771,6 +790,31 @@ fn decode_responses_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
             push_responses_function_tool(&mut out, tool);
         } else {
             push_responses_id_tool(&mut out, tool);
+        }
+    }
+    // Children keep their original names and carry the container they came from.
+    // The target encoder qualifies the name on the wire, so two children that
+    // differ only by namespace no longer collide.
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        let Some(namespace) = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|namespace| !namespace.is_empty())
+        else {
+            out.extend(decode_responses_tools(tool.get("tools")));
+            continue;
+        };
+        for mut child in decode_responses_tools(tool.get("tools")) {
+            if child.namespace().is_none() {
+                child.set_namespace(namespace);
+            }
+            out.push(child);
         }
     }
     out
@@ -796,6 +840,7 @@ fn push_responses_function_tool(
             .map(ToOwned::to_owned),
         parameters: tool.get("parameters").cloned().unwrap_or_else(|| json!({})),
         strict: tool.get("strict").and_then(Value::as_bool),
+        provider: ProviderExtensions::default(),
     });
     true
 }
@@ -825,6 +870,7 @@ fn push_responses_id_tool(
             .cloned()
             .unwrap_or_else(|| json!({})),
         strict: None,
+        provider: ProviderExtensions::default(),
     });
     true
 }
@@ -995,12 +1041,18 @@ fn encode_responses_special_input(block: &ContentBlock) -> Option<Value> {
             "content": [{"type": "reasoning_text", "text": text}],
             "summary": [],
         })),
-        ContentBlock::ToolCall(call) => Some(json!({
-            "type": "function_call",
-            "call_id": call.id,
-            "name": call.name,
-            "arguments": json_string(&call.arguments),
-        })),
+        ContentBlock::ToolCall(call) => {
+            let mut item = json!({
+                "type": "function_call",
+                "call_id": call.id,
+                "name": call.name,
+                "arguments": json_string(&call.arguments),
+            });
+            if let Some(namespace) = call.namespace() {
+                item["namespace"] = Value::String(namespace.to_string());
+            }
+            Some(item)
+        }
         ContentBlock::ToolResult(result) => Some(json!({
             "type": "function_call_output",
             "call_id": result.tool_call_id,
@@ -1092,23 +1144,42 @@ fn encode_responses_content(
 
 // Encodes normalized tool definitions into Responses tool JSON.
 fn encode_responses_tools(tools: &[ToolDefinition]) -> Value {
-    Value::Array(
-        tools
-            .iter()
-            .map(|tool| {
-                let mut item = json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description.clone().unwrap_or_default(),
-                    "parameters": tool.parameters,
-                });
-                if let Some(strict) = tool.strict {
-                    item["strict"] = Value::Bool(strict);
-                }
-                item
-            })
-            .collect(),
-    )
+    // A Responses target understands Codex containers, so regroup namespaced
+    // tools under them rather than folding the namespace into each name.
+    let mut out: Vec<Value> = Vec::new();
+    let mut containers: Vec<(String, Vec<Value>)> = Vec::new();
+    for tool in tools {
+        let item = encode_responses_function_tool(tool);
+        match tool.namespace() {
+            None => out.push(item),
+            Some(namespace) => match containers.iter_mut().find(|(name, _)| name == namespace) {
+                Some((_, children)) => children.push(item),
+                None => containers.push((namespace.to_string(), vec![item])),
+            },
+        }
+    }
+    for (namespace, children) in containers {
+        out.push(json!({
+            "type": "namespace",
+            "name": namespace,
+            "tools": children,
+        }));
+    }
+    Value::Array(out)
+}
+
+// Encodes one tool as a flat Responses function entry.
+fn encode_responses_function_tool(tool: &ToolDefinition) -> Value {
+    let mut item = json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description.clone().unwrap_or_default(),
+        "parameters": tool.parameters,
+    });
+    if let Some(strict) = tool.strict {
+        item["strict"] = Value::Bool(strict);
+    }
+    item
 }
 
 // Encodes normalized tool choice into Responses JSON.
@@ -1156,6 +1227,7 @@ fn decode_responses_output_item(
                     .unwrap_or_default()
                     .to_string(),
                 arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                provider: ProviderExtensions::default(),
             })],
             stop_reason: Some(StopReason::ToolUse),
         })),

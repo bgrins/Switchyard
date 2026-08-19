@@ -71,6 +71,7 @@ fn tool_call_turn() -> Response {
                     id: "t1".to_string(),
                     name: "bash".to_string(),
                     arguments: serde_json::json!({}),
+                    ..Default::default()
                 })],
                 stop_reason: None,
             }],
@@ -745,6 +746,7 @@ async fn pattern_trigger_matches_on_tool_call_turns() {
                         id: "t1".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({}),
+                        ..Default::default()
                     }),
                 ],
                 stop_reason: Some(StopReason::ToolUse),

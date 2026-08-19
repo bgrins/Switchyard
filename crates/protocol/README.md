@@ -75,6 +75,7 @@ let request = Request {
                 "required": ["name"]
             }),
             strict: Some(true),
+            ..Default::default()
         }],
         tool_choice: Some(ToolChoice::Auto),
         sampling: SamplingParams {
